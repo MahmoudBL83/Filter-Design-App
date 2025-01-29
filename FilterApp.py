@@ -19,6 +19,8 @@ import json
 from PyQt5.QtCore import QTimer
 from collections import deque
 import time
+import pyqtgraph as pg
+pg.setConfigOptions(antialias=True)
 
 # Dark theme colors
 DARK_PRIMARY = "#1e1e1e"
@@ -74,7 +76,48 @@ class FilterDesignApp(QMainWindow):
         layout = QHBoxLayout(main_widget)
         layout.setSpacing(10)
         layout.setContentsMargins(10, 10, 10, 10)
+
+        # Create tab widget
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
         
+        # Create tabs
+        self.filter_design_tab = QWidget()
+        self.real_time_tab = QWidget()
+        
+        # Add tabs
+        self.tabs.addTab(self.filter_design_tab, "Filter Design")
+        self.tabs.addTab(self.real_time_tab, "Real-time Processing")
+        
+        # Setup layouts for each tab
+        self.setup_filter_design_tab()
+        self.setup_real_time_tab()
+        
+        
+        
+        
+        
+        # Initialize signal processing variables
+        from collections import deque
+        self.max_samples = 10000
+        self.input_signal = deque(maxlen=self.max_samples)
+        self.output_signal = deque(maxlen=self.max_samples)
+        self.buffer_index = 0
+        self.last_time = time.time()
+        self.last_mouse_pos = None
+
+        # Remove phase_corrected_signal
+        self.processing_speed = 50
+        self.last_mouse_y = None
+
+        self.process_timer = QTimer()
+        self.process_timer.timeout.connect(self.process_next_sample)
+        self.process_timer.start(20)
+
+    def setup_filter_design_tab(self):
+        """Setup the filter design tab with z-plane and frequency response"""
+        layout = QHBoxLayout()
+
         # Left panel styling and setup
         left_panel = QGroupBox("Controls")
         left_panel.setStyleSheet(f"""
@@ -260,22 +303,44 @@ class FilterDesignApp(QMainWindow):
         points_layout.addWidget(self.conjugate_check)
         points_group.setLayout(points_layout)
         
-        # Implementation Group
-        impl_group = QGroupBox("Implementation")
-        impl_layout = QVBoxLayout()
-        impl_layout.addWidget(self.direct_form)
-        impl_layout.addWidget(self.cascade_form)
-        impl_layout.addWidget(self.export)
-        impl_layout.addWidget(self.code)
-        impl_group.setLayout(impl_layout)
+        
         
         # Add all groups to main layout
         left_layout.addWidget(points_group)
-        left_layout.addWidget(impl_group)
         left_panel.setLayout(left_layout)
         
         # Update plot styling
         plt.style.use('dark_background')
+
+        zoom_layout = QHBoxLayout()
+        zoom_layout.addWidget(QLabel("Zoom:"))
+        
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setMinimum(100)  # 1x zoom
+        self.zoom_slider.setMaximum(400)  # 4x zoom
+        self.zoom_slider.setValue(200)     # 2x default
+        self.zoom_slider.valueChanged.connect(self.update_zoom)
+        
+        zoom_layout.addWidget(self.zoom_slider)
+        zoom_layout.addWidget(QLabel("1x"))
+        zoom_layout.addWidget(QLabel("4x"))
+        
+        left_layout.addLayout(zoom_layout)
+        
+        # Style the zoom slider
+        self.zoom_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background: {DARK_SECONDARY};
+                height: 6px;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {ACCENT_COLOR};
+                width: 18px;
+                margin: -6px 0;
+                border-radius: 9px;
+            }}
+        """)
         
         
         
@@ -301,9 +366,12 @@ class FilterDesignApp(QMainWindow):
         right_layout = QVBoxLayout()
         self.freq_figure = Figure(figsize=(6, 8))
         self.freq_canvas = FigureCanvas(self.freq_figure)
-        # Initialize frequency response plots
-        self.mag_ax = self.freq_figure.add_subplot(211)
-        self.phase_ax = self.freq_figure.add_subplot(212)
+        
+        # Create two subplots for magnitude and phase
+        gs = self.freq_figure.add_gridspec(2, 1, height_ratios=[1, 1])
+        self.mag_ax = self.freq_figure.add_subplot(gs[0])
+        self.phase_ax = self.freq_figure.add_subplot(gs[1])
+        
         right_layout.addWidget(self.freq_canvas)
         right_panel.setLayout(right_layout)
         
@@ -314,32 +382,59 @@ class FilterDesignApp(QMainWindow):
         
         self.initialize_plots()
 
-        
-        
-        
-        # Initialize signal processing variables
-        from collections import deque
-        self.max_samples = 10000
-        self.input_signal = deque(maxlen=self.max_samples)
-        self.output_signal = deque(maxlen=self.max_samples)
-        self.phase_corrected_signal = deque(maxlen=self.max_samples)
-        self.buffer_index = 0
-        self.last_time = time.time()
-        self.last_mouse_pos = None
 
-        self.phase_corrected_signal = []
-        self.processing_speed = 50
-        self.last_mouse_y = None
-
-        self.process_timer = QTimer()
-        self.process_timer.timeout.connect(self.process_next_sample)
-        self.process_timer.start(20)
-
-        signal_panel = self.setup_signal_panel()
-        all_pass_panel = self.setup_all_pass_panel()
-        layout.addWidget(all_pass_panel)
-        layout.addWidget(signal_panel)
         
+        self.filter_design_tab.setLayout(layout)
+
+        self.direct_form.toggled.connect(self.on_form_changed)
+        self.cascade_form.toggled.connect(self.on_form_changed)
+
+    def on_form_changed(self):
+        """Handle filter form change"""
+        # Reset filter states
+        self.direct_state = None
+        self.cascade_state = None
+        
+        # Clear output buffer to show new response
+        self.output_signal.clear()
+        
+        # Update plots if in real-time tab
+        self.update_signal_plots()
+        
+        # Print current form for debugging
+        print(f"Changed to: {'Direct Form II' if self.direct_form.isChecked() else 'Cascade Form'}")
+
+    def setup_real_time_tab(self):
+        """Setup the real-time processing tab with all-pass filters and signal processing"""
+        layout = QHBoxLayout()
+        
+        # Combine all-pass and real-time panels
+        left_side = self.setup_all_pass_panel()
+        right_side = self.setup_signal_panel()
+        
+        layout.addWidget(left_side)
+        layout.addWidget(right_side)
+        
+        self.real_time_tab.setLayout(layout)
+
+    # Add tab styling
+    def setup_tab_styling(self):
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ 
+                border: 1px solid {ACCENT_COLOR};
+                background: {DARK_PRIMARY};
+            }}
+            QTabBar::tab {{
+                background: {DARK_SECONDARY};
+                color: {TEXT_COLOR};
+                padding: 8px;
+                margin: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background: {ACCENT_COLOR};
+            }}
+        """)
+            
     def setup_dark_palette(self):
         palette = QPalette()
         palette.setColor(QPalette.Window, QColor(DARK_PRIMARY))
@@ -358,31 +453,45 @@ class FilterDesignApp(QMainWindow):
         self.setPalette(palette)
 
     def initialize_plots(self):
-        # Update plot styling for dark mode
+        # Enhance z-plane
         self.z_ax = self.z_plane_figure.add_subplot(111, facecolor=PLOT_BG)
-        circle = Circle((0, 0), 1, fill=False, color=PLOT_TEXT)
+        
+        # Enhanced unit circle
+        circle = Circle((0, 0), 1, fill=False, color=PLOT_TEXT, linestyle='--', linewidth=2)
         self.z_ax.add_artist(circle)
-        self.z_ax.grid(True, color=PLOT_GRID)
+        
+        # Enhanced grid and labels
+        self.z_ax.grid(True, color=PLOT_GRID, linestyle='--', alpha=0.5)
         self.z_ax.set_aspect('equal')
         self.z_ax.set_xlim(-2, 2)
         self.z_ax.set_ylim(-2, 2)
-        self.z_ax.set_xlabel('Real', color=PLOT_TEXT)
-        self.z_ax.set_ylabel('Imaginary', color=PLOT_TEXT)
-        self.z_ax.set_title('Z-Plane', color=PLOT_TEXT)
-        self.z_ax.tick_params(colors=PLOT_TEXT)
-
-        self.z_plane_canvas.mpl_connect('button_press_event', self.on_press)
-        self.z_plane_canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.z_plane_canvas.mpl_connect('button_release_event', self.on_release)
-            
+        
+        
+        # Add major and minor grid lines
+        self.z_ax.grid(True, which='major', color=PLOT_GRID, linestyle='-', alpha=0.5)
+        self.z_ax.grid(True, which='minor', color=PLOT_GRID, linestyle=':', alpha=0.3)
+        self.z_ax.minorticks_on()
+        
+        # Enhanced labels
+        self.z_ax.set_xlabel('Real Part', color=PLOT_TEXT, fontsize=12)
+        self.z_ax.set_ylabel('Imaginary Part', color=PLOT_TEXT, fontsize=12)
+        self.z_ax.set_title('Z-Plane Plot', color=PLOT_TEXT, fontsize=14, pad=20)
+        
+        # Add axes lines
+        self.z_ax.axhline(y=0, color=PLOT_TEXT, linestyle='-', alpha=0.3)
+        self.z_ax.axvline(x=0, color=PLOT_TEXT, linestyle='-', alpha=0.3)
+        
         # Update frequency response plots styling
         for ax in [self.mag_ax, self.phase_ax]:
             ax.set_facecolor(PLOT_BG)
-            ax.grid(True, color=PLOT_GRID)
-            ax.tick_params(colors=PLOT_TEXT)
+            ax.grid(True, which='both', color=PLOT_GRID, linestyle='--', alpha=0.5)
+            ax.tick_params(colors=PLOT_TEXT, which='both')
+            ax.minorticks_on()
             
             for spine in ax.spines.values():
                 spine.set_color(PLOT_TEXT)
+                spine.set_linewidth(1.5)
+
 
     def set_mode(self, mode):
         """Sets the current tool mode (zero/pole/drag) and updates button states"""
@@ -468,27 +577,45 @@ class FilterDesignApp(QMainWindow):
     def update_plots(self):
         self.z_ax.clear()
         
-        # Redraw unit circle and grid
-        circle = Circle((0, 0), 1, fill=False, color='black')
+        # Redraw enhanced unit circle and grid
+        circle = Circle((0, 0), 1, fill=False, color=PLOT_TEXT, linestyle='--', linewidth=2)
         self.z_ax.add_artist(circle)
-        self.z_ax.grid(True)
+        
+        # Enhanced grid setup
+        self.z_ax.grid(True, which='both', color=PLOT_GRID, linestyle='--', alpha=0.5)
         self.z_ax.set_aspect('equal')
         self.z_ax.set_xlim(-2, 2)
         self.z_ax.set_ylim(-2, 2)
         
-        # Plot zeros and poles
+        # Plot zeros and poles with enhanced markers
         for zero in self.zeros:
-            self.z_ax.plot(zero.real, zero.imag, 'bo', markersize=10)
+            self.z_ax.plot(zero.real, zero.imag, 'o', color='blue', 
+                        markersize=12, markeredgewidth=2, 
+                        markerfacecolor='none', label='Zeros')
+        
         for pole in self.poles:
-            self.z_ax.plot(pole.real, pole.imag, 'rx', markersize=10)
-            
+            self.z_ax.plot(pole.real, pole.imag, 'x', color='red',
+                        markersize=12, markeredgewidth=2,
+                        label='Poles')
+        
+        # Enhanced axes and labels
+        self.z_ax.set_xlabel('Real Part', color=PLOT_TEXT, fontsize=12)
+        self.z_ax.set_ylabel('Imaginary Part', color=PLOT_TEXT, fontsize=12)
+        self.z_ax.set_title('Z-Plane Plot', color=PLOT_TEXT, fontsize=14, pad=20)
+        
+        # Add legend
+        handles, labels = self.z_ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        self.z_ax.legend(by_label.values(), by_label.keys(), 
+                        loc='upper right', facecolor=PLOT_BG, 
+                        edgecolor=PLOT_TEXT)
+        
         self.z_plane_canvas.draw()
         self.update_frequency_response()
         
     def update_frequency_response(self):
-        """Update both magnitude and phase frequency responses"""
-        # Calculate frequency points
-        w = np.linspace(0, np.pi, 1000)
+        # Calculate frequency points with higher resolution
+        w = np.linspace(0, np.pi, 2000)
         z = np.exp(1j * w)
         
         # Calculate transfer function
@@ -506,28 +633,43 @@ class FilterDesignApp(QMainWindow):
         self.mag_ax.clear()
         self.phase_ax.clear()
         
-        # Plot magnitude response
+        # Enhanced magnitude plot
         self.mag_ax.plot(w/np.pi, mag_db, 'w-', linewidth=2)
-        self.mag_ax.set_ylabel('Magnitude (dB)', color=PLOT_TEXT)
-        self.mag_ax.grid(True, color=PLOT_GRID)
-        self.mag_ax.set_title('Magnitude Response', color=PLOT_TEXT)
+        self.mag_ax.set_ylabel('Magnitude (dB)', color=PLOT_TEXT, fontsize=12)
+        self.mag_ax.grid(True, which='both', color=PLOT_GRID, linestyle='--', alpha=0.5)
+        self.mag_ax.set_title('Magnitude Response', color=PLOT_TEXT, fontsize=14)
         
-        # Plot phase response
+        # Add magnitude guidelines
+        mag_yticks = np.arange(np.floor(min(mag_db)/10)*10, 
+                            np.ceil(max(mag_db)/10)*10, 10)
+        self.mag_ax.set_yticks(mag_yticks)
+        
+        # Enhanced phase plot
         self.phase_ax.plot(w/np.pi, phase_deg, 'w-', linewidth=2)
-        self.phase_ax.set_xlabel('Normalized Frequency (×π rad/sample)', color=PLOT_TEXT)
-        self.phase_ax.set_ylabel('Phase (degrees)', color=PLOT_TEXT)
-        self.phase_ax.grid(True, color=PLOT_GRID)
-        self.phase_ax.set_title('Phase Response', color=PLOT_TEXT)
+        self.phase_ax.set_xlabel('Normalized Frequency (×π rad/sample)', 
+                            color=PLOT_TEXT, fontsize=12)
+        self.phase_ax.set_ylabel('Phase (degrees)', color=PLOT_TEXT, fontsize=12)
+        self.phase_ax.grid(True, which='both', color=PLOT_GRID, linestyle='--', alpha=0.5)
+        self.phase_ax.set_title('Phase Response', color=PLOT_TEXT, fontsize=14)
         
-        # Update styling for both plots
+        # Add phase guidelines
+        phase_yticks = np.arange(np.floor(min(phase_deg)/90)*90, 
+                                np.ceil(max(phase_deg)/90)*90, 90)
+        self.phase_ax.set_yticks(phase_yticks)
+        
+        # Add frequency guidelines
+        for ax in [self.mag_ax, self.phase_ax]:
+            ax.set_xticks(np.arange(0, 1.1, 0.2))
+            ax.set_xticklabels([f'{x:.1f}π' for x in np.arange(0, 1.1, 0.2)])
+            ax.grid(True, which='both', color=PLOT_GRID, linestyle='--', alpha=0.5)
+        
+        # Update styling
         for ax in [self.mag_ax, self.phase_ax]:
             ax.set_facecolor(PLOT_BG)
-            ax.grid(True, color=PLOT_GRID)
             ax.tick_params(colors=PLOT_TEXT)
-            
             for spine in ax.spines.values():
                 spine.set_color(PLOT_TEXT)
-                
+        
         # Adjust layout and draw
         self.freq_figure.tight_layout()
         self.freq_canvas.draw()
@@ -879,28 +1021,31 @@ class FilterDesignApp(QMainWindow):
         """
         Generate and save C code for the designed filter to a file.
         """
-        file_name = "filter_design.c"  
+        file_name = "filter_design.c"  # You can change this to a dynamic name if needed.
 
+        # Generate the C code using zeros and poles.
         c_code = f"""\
-#include <stdio.h>
-#include <math.h>
+    #include <stdio.h>
+    #include <math.h>
 
-#define NUM_ZEROS {len(self.zeros)}
-#define NUM_POLES {len(self.poles)}
+    // Example filter coefficients (Replace with your filter's design)
+    #define NUM_ZEROS {len(self.zeros)}
+    #define NUM_POLES {len(self.poles)}
 
-double zeros[NUM_ZEROS] = {{{', '.join([f'{z.real:.6f} + {z.imag:.6f}i' for z in self.zeros])}}};
-double poles[NUM_POLES] = {{{', '.join([f'{p.real:.6f} + {p.imag:.6f}i' for p in self.poles])}}};
+    double zeros[NUM_ZEROS] = {{{', '.join([f'{z.real:.6f} + {z.imag:.6f}i' for z in self.zeros])}}};
+    double poles[NUM_POLES] = {{{', '.join([f'{p.real:.6f} + {p.imag:.6f}i' for p in self.poles])}}};
 
-void apply_filter(double *input, double *output, int length) {{
-    for (int i = 0; i < length; i++) {{
-        output[i] = input[i];
+    void apply_filter(double *input, double *output, int length) {{
+        // Implement filter processing here
+        for (int i = 0; i < length; i++) {{
+            output[i] = input[i]; // Placeholder: Replace with actual processing logic
+        }}
     }}
-}}
 
-int main() {{
-    printf("Filter Design Loaded\\n");
-    return 0;
-}}
+    int main() {{
+        printf("Filter Design Loaded\\n");
+        return 0;
+    }}
     """
 
         # Save the generated C code to a file.
@@ -926,24 +1071,19 @@ int main() {{
                                     maxlen=value*10)
     
     def process_next_sample(self):
-        """Process next input sample through filter chain"""
+        """Process next sample with length checking"""
         if not self.input_signal:
             return
             
         try:
-            # Get latest sample
             x = self.input_signal[-1]
-            
-            # Apply main filter
             y = self.apply_selected_filter(x)
+            
+            # Maintain equal buffer lengths
             self.output_signal.append(float(y))
-            
-            # Apply all-pass filters if enabled
-            if self.all_pass_enabled.isChecked():
-                y = self.apply_all_pass_filters(y)
+            while len(self.output_signal) > len(self.input_signal):
+                self.output_signal.popleft()
                 
-            self.phase_corrected_signal.append(float(y))
-            
             # Update visualization periodically
             if len(self.input_signal) % 10 == 0:
                 self.update_signal_plots()
@@ -962,7 +1102,7 @@ int main() {{
         dy = event.y() - self.last_y
         
         # Convert mouse movement to signal value (-1 to 1 range)
-        y = (self.drawing_area.height() - event.y()) / self.drawing_area.height() * 2 - 1
+        y = (self.draw_area.height() - event.y()) / self.draw_area.height() * 2 - 1
         
         # Add to input buffer with rate limiting
         if len(self.input_signal) < 10000:  # Maintain max buffer size
@@ -995,10 +1135,14 @@ int main() {{
             # Get coefficients based on selected form
             if self.direct_form.isChecked():
                 coeffs = self.generate_direct_form_II()
-                return self.apply_direct_form(x, coeffs)
+                y = self.apply_direct_form(x, coeffs)
+                print(f"Direct Form Output: {y}")  # Debug output
+                return y
             else:
                 coeffs = self.generate_cascade_form()
-                return self.apply_cascade_form(x, coeffs)
+                y = self.apply_cascade_form(x, coeffs)
+                print(f"Cascade Form Output: {y}")  # Debug output
+                return y
                 
         except Exception as e:
             print(f"Error applying filter: {e}")
@@ -1098,54 +1242,24 @@ int main() {{
         return y
             
     def update_signal_plots(self):
-        if not self.input_signal or not hasattr(self, 'window_size_spin'):
+        """Update scrolling signal display"""
+        if not self.input_signal:
             return
             
         # Get window size
-        window_size = self.window_size_spin.value()
+        window = self.window_spin.value()
         
-        # Convert deques to numpy arrays, ensuring same length
-        input_data = np.array(list(self.input_signal))
-        output_data = np.array(list(self.output_signal))
-        phase_data = np.array(list(self.phase_corrected_signal))
+        # Get recent samples
+        input_data = np.array(list(self.input_signal)[-window:])
+        output_data = np.array(list(self.output_signal)[-window:])
         
-        # Ensure all arrays have same length
-        min_len = min(len(input_data), len(output_data), len(phase_data))
-        if min_len == 0:
-            return
-            
-        input_data = input_data[-min_len:]
-        output_data = output_data[-min_len:]
-        phase_data = phase_data[-min_len:]
-        
-        # Get data window
-        if min_len > window_size:
-            input_data = input_data[-window_size:]
-            output_data = output_data[-window_size:]
-            phase_data = phase_data[-window_size:]
-        
-        # Create time axis
-        t = np.arange(len(input_data))
+        # Create time axis in seconds
+        dt = 1.0 / self.processing_speed
+        t = np.arange(len(input_data)) * dt
         
         # Update plots
-        self.input_ax.clear()
-        self.output_ax.clear()
-        self.phase_ax.clear()
-        
-        # Plot synchronized data
-        self.input_ax.plot(t, input_data, 'b-', label='Input')
-        self.output_ax.plot(t, output_data, 'r-', label='Filtered') 
-        self.phase_ax.plot(t, phase_data, 'g-', label='Phase Corrected')
-        
-        # Set proper labels and limits
-        for ax in [self.input_ax, self.output_ax, self.phase_ax]:
-            ax.grid(True)
-            ax.legend()
-            ax.set_ylim(min(input_data.min(), output_data.min(), phase_data.min()) - 0.1,
-                        max(input_data.max(), output_data.max(), phase_data.max()) + 0.1)
-        
-        self.signal_figure.tight_layout()
-        self.signal_canvas.draw()
+        self.input_curve.setData(t, input_data)
+        self.output_curve.setData(t, output_data)
 
     def export_filter(self):
         # Get current implementation type
@@ -1250,11 +1364,21 @@ int main() {{
         
         custom_layout.addWidget(self.a_input)
         custom_layout.addWidget(add_btn)
+
+        # Implementation Group
+        impl_group = QGroupBox("Implementation")
+        impl_layout = QVBoxLayout()
+        impl_layout.addWidget(self.direct_form)
+        impl_layout.addWidget(self.cascade_form)
+        impl_layout.addWidget(self.export)
+        impl_layout.addWidget(self.code)
+        impl_group.setLayout(impl_layout)
         
         # Add widgets to layout
         layout.addWidget(self.all_pass_enabled)
         layout.addWidget(self.all_pass_list)
         layout.addLayout(custom_layout)
+        layout.addWidget(impl_group)
         
         panel.setLayout(layout)
         return panel
@@ -1285,57 +1409,66 @@ int main() {{
                             "Please enter a valid number")
     
     def setup_signal_panel(self):
+        """Setup real-time signal processing panel"""
         panel = QGroupBox("Real-time Processing")
         layout = QVBoxLayout()
-        
-        # Speed control with wider range
+
+        # Speed control with finer granularity
         speed_layout = QHBoxLayout()
         self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setMinimum(1)
-        self.speed_slider.setMaximum(100)
-        self.speed_slider.setValue(50)
-        self.speed_value_label = QLabel("50 samples/second")
-        self.speed_slider.valueChanged.connect(self.update_speed)
+        self.speed_slider.setRange(1, 100)  # 1-100 points/sec
+        self.speed_slider.setValue(10)  # Default 10 pts/sec
+        
+        self.speed_label = QLabel("10 pts/sec")
+        self.speed_slider.valueChanged.connect(self.update_processing_speed)
         
         speed_layout.addWidget(QLabel("Processing Speed:"))
         speed_layout.addWidget(self.speed_slider)
-        speed_layout.addWidget(self.speed_value_label)
-        
-        # Signal visualization controls
-        viz_layout = QHBoxLayout()
-        self.window_size_spin = QSpinBox()
-        self.window_size_spin.setRange(100, 1000)
-        self.window_size_spin.setValue(200)
-        self.window_size_spin.valueChanged.connect(self.update_visualization)
-        
-        viz_layout.addWidget(QLabel("Window Size:"))
-        viz_layout.addWidget(self.window_size_spin)
-        
-        # Mouse input area
-        self.drawing_area = QWidget()
-        self.drawing_area.setMinimumSize(300, 100)
-        self.drawing_area.setStyleSheet(f"""
+        speed_layout.addWidget(self.speed_label)
+
+        # Window size control
+        window_layout = QHBoxLayout()
+        self.window_spin = QSpinBox()
+        self.window_spin.setRange(100, 1000)
+        self.window_spin.setValue(200)
+        self.window_spin.setSingleStep(50)
+        window_layout.addWidget(QLabel("View Window (pts):"))
+        window_layout.addWidget(self.window_spin)
+
+        # Drawing area with coordinate display
+        self.draw_area = QWidget()
+        self.draw_area.setMinimumSize(300, 100)
+        self.draw_area.setStyleSheet(f"""
             QWidget {{
                 background-color: {DARK_SECONDARY};
                 border: 1px solid {ACCENT_COLOR};
             }}
         """)
-        self.drawing_area.setMouseTracking(True)
-        self.drawing_area.installEventFilter(self)
+        self.draw_area.setMouseTracking(True)
+        self.draw_area.installEventFilter(self)
         
-        # Signal plots with three traces
-        self.signal_figure = Figure(figsize=(6, 6))
-        self.signal_canvas = FigureCanvas(self.signal_figure)
+        # Signal plots
+        self.input_plot = pg.PlotWidget(title="Input Signal")
+        self.output_plot = pg.PlotWidget(title="Filtered Signal") 
         
-        self.input_ax = self.signal_figure.add_subplot(311)
-        self.output_ax = self.signal_figure.add_subplot(312)
-        self.phase_ax = self.signal_figure.add_subplot(313)
+        # Configure plots
+        for plot in [self.input_plot, self.output_plot]:
+            plot.setBackground(PLOT_BG)
+            plot.showGrid(x=True, y=True)
+            plot.setLabel('bottom', "Time (s)")
+            plot.setLabel('left', "Amplitude")
+            plot.setYRange(-1.1, 1.1)
+            
+        # Add curves
+        self.input_curve = self.input_plot.plot(pen='y')
+        self.output_curve = self.output_plot.plot(pen='c')
         
-        # Add all widgets
+        # Add widgets to layout
         layout.addLayout(speed_layout)
-        layout.addLayout(viz_layout)
-        layout.addWidget(self.drawing_area)
-        layout.addWidget(self.signal_canvas)
+        layout.addLayout(window_layout)
+        layout.addWidget(self.draw_area)
+        layout.addWidget(self.input_plot)
+        layout.addWidget(self.output_plot)
         
         panel.setLayout(layout)
         return panel
@@ -1373,36 +1506,51 @@ int main() {{
 
     def eventFilter(self, obj, event):
         """Handle mouse events in drawing area"""
-        if obj is self.drawing_area:
+        if obj is self.draw_area:
             if event.type() == event.MouseMove:
                 self.handle_mouse_draw(event)
                 return True
         return super().eventFilter(obj, event)
 
+    def update_processing_speed(self, value):
+        """Update processing speed and display"""
+        self.processing_speed = value
+        self.speed_label.setText(f"{value} pts/sec")
+        
+        # Update timer interval (ms)
+        interval = int(1000 / value)
+        self.process_timer.setInterval(interval)
+        
+        # Clear old data
+        self.reset_signal_buffers()
+
     def handle_mouse_draw(self, event):
-        """Handle mouse movement for signal generation"""
+        """Generate input signal from mouse movement"""
         if not hasattr(self, 'last_pos'):
             self.last_pos = event.pos()
             self.last_time = time.time()
             return
             
-        # Calculate mouse velocity for frequency
+        # Calculate mouse velocity 
         dt = time.time() - self.last_time
         dx = event.pos().x() - self.last_pos.x()
         dy = event.pos().y() - self.last_pos.y()
         velocity = np.sqrt(dx*dx + dy*dy) / dt
         
-        # Convert position to signal value (-1 to 1)
-        y = 1.0 - (2.0 * event.pos().y() / self.drawing_area.height())
+        # Generate signal based on y position
+        y = 1.0 - (2.0 * event.pos().y() / self.draw_area.height())
         
-        # Add to input buffer
+        # Add frequency component based on velocity
+        if velocity > 0:
+            freq = min(20, velocity / 100)  # Cap max frequency
+            y *= np.sin(2 * np.pi * freq * dt)
+        
         self.input_signal.append(float(y))
         
         # Update state
         self.last_pos = event.pos()
         self.last_time = time.time()
         
-        # Process sample
         self.process_next_sample()
     
     def process_all_pass(self, x):
@@ -1426,6 +1574,20 @@ int main() {{
         """Update signal visualization with new window size"""
         self.update_signal_plots()
 
+
+    #z-plane
+
+    def update_zoom(self):
+        """Update z-plane zoom level based on slider value"""
+        zoom_factor = self.zoom_slider.value() / 100.0  # Convert to multiplier (1.0 - 4.0)
+        
+        # Update axis limits maintaining center and aspect ratio
+        limit = 2.0 * (4.0 / zoom_factor)  # Scale limits inversely with zoom
+        self.z_ax.set_xlim(-limit, limit)
+        self.z_ax.set_ylim(-limit, limit)
+        
+        # Redraw with new limits
+        self.z_plane_canvas.draw()
 
 
 class AllPassFilter:
@@ -1481,6 +1643,7 @@ class AllPassLibrary:
             return True
         return False
 
+    
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
